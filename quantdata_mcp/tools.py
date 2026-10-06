@@ -36,6 +36,12 @@ class ToolType(str, Enum):
     DARK_POOL_LEVELS = "DARK_POOL_LEVELS_TABLE"
     EQUITY_PRINTS = "EQUITY_PRINTS_TABLE"
     STOCK_PRICE_TIME = "STOCK_PRICE_OVER_TIME_CHART"
+    # Added locally (not yet in the upstream repo) -- discovered on the live
+    # QuantData web app by inspecting the Agentic Page's tool layout, then
+    # probing `options/exposure/forecast/{tool_id}` by analogy with the
+    # existing `options/exposure/strike` / `options/exposure/expiration`
+    # endpoint-naming convention. See AGENTS.md for details.
+    EXPOSURE_FORECAST = "OPTIONS_EXPOSURE_FORECAST_CHART"
 
 
 class GreekMode(str, Enum):
@@ -275,6 +281,13 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
         tool_type=ToolType.STOCK_PRICE_TIME,
         endpoint="equity/price/time",
         label="Stock Price / Time",
+    ),
+    # Locally added (not upstream) -- see ToolType.EXPOSURE_FORECAST.
+    "exposure_forecast": ToolDefinition(
+        canonical_name="exposure_forecast",
+        tool_type=ToolType.EXPOSURE_FORECAST,
+        endpoint="options/exposure/forecast",
+        label="Exposure Forecast",
     ),
 }
 

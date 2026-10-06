@@ -2926,6 +2926,225 @@ def qd_get_stock_price_time(
 
 
 # ---------------------------------------------------------------------------
+# Exposure Forecast — locally added, NOT part of the upstream quantdata-mcp
+# tool catalog or its docs. Discovered by inspecting the live QuantData web
+# app's "MCP Agentic Page" layout (OPTIONS_EXPOSURE_FORECAST_CHART tool type
+# the user added via the UI), then probing `options/exposure/forecast/
+# {tool_id}` by analogy with the existing exposure endpoint naming
+# convention (`options/exposure/strike`, `options/exposure/expiration`).
+# ---------------------------------------------------------------------------
+
+import re as _re_fc  # noqa: E402 — local import, kept near its only use
+from quantdata_mcp._forecast_model import compute_forecast_projection  # noqa: E402
+
+
+def _fmt_exposure_forecast(
+    data: dict[str, Any] | None, ticker: str = "SPX", last_n: int = 12
+) -> str:
+    """Render the Exposure Forecast chart.
+
+    Canonical shape (from /api/options/exposure/forecast/{tool_id}):
+        response.ticker
+        response.zeroGamma -> {priceInCents, grossGammaExposure,
+            netGammaExposure, isCapSensitive, isOffSpot, isWrongSide}
+        response.levels -> {callWallPriceInCents,
+            maximumValueContractStrikePriceInCents, ...} (keys vary)
+        response.darkPoolLevels -> {price_cents: size}
+        response.liveSession -> {sessionDate, observations: [...]}
+            (today's running session; ~15min cadence)
+        response.historicalSessions -> [{sessionDate, observations}, ...]
+        response.stockPriceInCentsByEpochMillisTimestamp -> {ts_ms: cents}
+        response.stockPriceOhlcByEpochMillisTimestamp -> {ts_ms: {open,
+            high, low, close, timestamp}}
+
+    Each observation: {targetTimeEpochMillisTimestamp, state (observed
+        values so far: PIN / GRIND / HOSTILE), stockPriceInCents,
+        realizedVolatilityPercentage?, atTheMoneyStrikePriceInCents?,
+        atTheMoneyCallPriceInCents?, atTheMoneyPutPriceInCents?,
+        atTheMoneyDaysToExpiration?}
+
+    ``state`` meanings (inferred, not documented by QuantData):
+        PIN     — price pinned near a high-gamma strike, low realized vol
+        GRIND   — range-bound chop
+        HOSTILE — elevated realized vol / breakout risk
+    """
+    if not data or "response" not in data:
+        return "No exposure forecast data available."
+
+    resp = data["response"]
+    zg = resp.get("zeroGamma") or {}
+    levels = resp.get("levels") or {}
+    dark_pool = resp.get("darkPoolLevels") or {}
+    live = resp.get("liveSession") or {}
+    hist = resp.get("historicalSessions") or []
+
+    lines = [f"Exposure Forecast — {ticker}", ""]
+
+    zg_price_cents = zg.get("priceInCents")
+    if zg_price_cents:
+        flags = [
+            name
+            for name, key in (
+                ("off-spot", "isOffSpot"),
+                ("cap-sensitive", "isCapSensitive"),
+                ("wrong-side", "isWrongSide"),
+            )
+            if zg.get(key)
+        ]
+        flag_str = f" ({', '.join(flags)})" if flags else ""
+        lines.append(f"Zero Gamma: ${zg_price_cents / 100:,.2f}{flag_str}")
+        gross = zg.get("grossGammaExposure")
+        net = zg.get("netGammaExposure")
+        if gross is not None or net is not None:
+            parts = []
+            if gross is not None:
+                parts.append(f"Gross {gross:,.0f}")
+            if net is not None:
+                parts.append(f"Net {net:,.0f}")
+            lines.append("  Gamma Exposure: " + "  ".join(parts))
+
+    if levels:
+        level_strs = []
+        for key, cents in levels.items():
+            if cents is None:
+                continue
+            label = key.replace("PriceInCents", "").replace("InCents", "")
+            label = _re_fc.sub(r"(?<!^)(?=[A-Z])", " ", label).strip()
+            label = label[:1].upper() + label[1:]
+            level_strs.append(f"{label}: ${cents / 100:,.2f}")
+        if level_strs:
+            lines.append("Levels: " + " | ".join(level_strs))
+
+    if dark_pool:
+        lines.append(f"Dark Pool Levels: {len(dark_pool)} price level(s) tracked")
+
+    lines.append("")
+
+    def _render_session(label: str, session: dict[str, Any], n: int) -> list[str]:
+        obs = session.get("observations") or []
+        if not obs:
+            return [f"{label}: no observations."]
+        et = ZoneInfo("America/New_York")
+        tail = obs[-n:]
+        out = [
+            f"{label} ({session.get('sessionDate', '?')}) — "
+            f"last {len(tail)} of {len(obs)} observations:",
+            "",
+            f"  {'Time (ET)':>10}  {'State':>8}  {'Price':>10}  {'RV%':>8}",
+            "  " + "-" * 42,
+        ]
+        for o in tail:
+            ts = o.get("targetTimeEpochMillisTimestamp")
+            try:
+                t = datetime.fromtimestamp(ts / 1000, tz=et).strftime("%H:%M")
+            except Exception:
+                t = "?"
+            state = o.get("state", "?")
+            px = (o.get("stockPriceInCents") or 0) / 100
+            rv = o.get("realizedVolatilityPercentage")
+            rv_str = f"{rv:.1f}" if rv is not None else "—"
+            out.append(f"  {t:>10}  {state:>8}  ${px:>8,.2f}  {rv_str:>8}")
+        return out
+
+    lines.extend(_render_session("Live Session", live, last_n))
+    lines.append("")
+
+    # Reproduced forward projection ("Holds X%" / "Typical move") -- NOT a
+    # field QuantData's API returns. Their own UI computes this client-side
+    # from this same payload (session-block bootstrap over a 20-business-day
+    # transition pool + a 70-session outcome pool); this is a best-effort
+    # Python port, validated to track the live chart within ~1-2pp on hold%
+    # and almost exactly on typical move. See _forecast_model.py.
+    try:
+        projection = compute_forecast_projection(resp)
+    except Exception:
+        projection = None
+    if projection:
+        lines.append(
+            f"Forward Projection (reproduced locally, not a QuantData API field) — "
+            f"state={projection['current_state_display']}, "
+            f"trained on {projection['transition_pool_sessions']} sessions (holds) / "
+            f"{projection['outcome_pool_sessions']} sessions (move):"
+        )
+        lines.append(f"  {'Horizon':>8}  {'Holds':>8}  {'Conf':>9}  {'n':>5}  {'Typical Move':>13}  {'n':>5}")
+        lines.append("  " + "-" * 62)
+        for h, stats in projection["horizons"].items():
+            tm = stats["typical_move_pct"]
+            tm_str = f"{tm:.2f}%" if tm is not None else "—"
+            lines.append(
+                f"  +{h:>5}m  {stats['hold_pct']:>7.1f}%  {stats['confidence']:>9}  "
+                f"{stats['n']:>5}  {tm_str:>13}  {stats['move_n']:>5}"
+            )
+        lines.append("")
+
+    state_counts: dict[str, int] = {}
+    final_state_counts: dict[str, int] = {}
+    for s in hist:
+        obs = s.get("observations") or []
+        for o in obs:
+            st = o.get("state")
+            if st:
+                state_counts[st] = state_counts.get(st, 0) + 1
+        if obs:
+            last_state = obs[-1].get("state")
+            if last_state:
+                final_state_counts[last_state] = final_state_counts.get(last_state, 0) + 1
+
+    if state_counts:
+        total = sum(state_counts.values())
+        lines.append(f"Historical regime mix ({len(hist)} sessions, {total} observations):")
+        for st, cnt in sorted(state_counts.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {st:>8}: {cnt:>5} ({cnt / total * 100:.1f}%)")
+        if final_state_counts:
+            ftotal = sum(final_state_counts.values())
+            lines.append(f"End-of-day state ({ftotal} sessions):")
+            for st, cnt in sorted(final_state_counts.items(), key=lambda kv: -kv[1]):
+                lines.append(f"  {st:>8}: {cnt:>5} ({cnt / ftotal * 100:.1f}%)")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def qd_get_exposure_forecast(
+    ticker: str | None = None,
+    last_n: int = 12,
+) -> str:
+    """Get the gamma-derived session regime forecast (PIN / GRIND / HOSTILE)
+    plus the zero-gamma level, call wall, and dark-pool levels.
+
+    NOT part of the official quantdata-mcp tool catalog or its docs —
+    reverse engineered from the live QuantData web app's "Exposure Forecast"
+    widget (OPTIONS_EXPOSURE_FORECAST_CHART) by inspecting the Agentic
+    Page's tool layout and probing the underlying
+    `options/exposure/forecast/{tool_id}` endpoint. Treat the field
+    semantics as inferred, not vendor-documented.
+
+    Classifies each ~15-minute window of the session into a regime:
+      - PIN: price pinned near a high-gamma strike (low realized vol)
+      - GRIND: range-bound chop
+      - HOSTILE: elevated realized vol / breakout risk
+
+    Args:
+        ticker: Ticker symbol (default: SPX). Any optionable ticker works.
+        last_n: Number of recent observations to render for the live
+            session (default: 12).
+    """
+    resolved_ticker = _resolve_active_ticker(ticker)
+    try:
+        with tool_context(
+            "exposure_forecast",
+            ticker=ticker,
+            filter_updates={"ticker": _eq(resolved_ticker)},
+        ) as ctx:
+            data = ctx.client.fetch_exposure_forecast(ctx.tool_spec.tool_id)
+        return _fmt_exposure_forecast(data, ticker=ctx.ticker, last_n=last_n)
+    except QuantDataAuthError:
+        return AUTH_ERROR_MESSAGE
+    except Exception as e:
+        return format_error("exposure forecast", e)
+
+
+# ---------------------------------------------------------------------------
 # Filter groups — server-side persistent named filter sets
 # ---------------------------------------------------------------------------
 #

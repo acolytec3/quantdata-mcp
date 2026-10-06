@@ -1091,6 +1091,51 @@ class QuantDataClient:
             return None
 
     # ------------------------------------------------------------------
+    # Data fetching -- locally added (not upstream)
+    # ------------------------------------------------------------------
+
+    def fetch_exposure_forecast(self, tool_id: str) -> dict[str, Any] | None:
+        """Fetch the Exposure Forecast chart -- gamma-derived regime
+        classification (PIN / GRIND / HOSTILE) per session, plus the day's
+        zero-gamma level, call wall, and dark-pool levels.
+
+        Not documented anywhere -- reverse engineered from the live
+        QuantData web app (OPTIONS_EXPOSURE_FORECAST_CHART tool type) by
+        probing endpoint names analogous to the existing exposure endpoints.
+
+        Args:
+            tool_id: Exposure Forecast tool ID
+
+        Returns:
+            Data dict or None if failed. Shape:
+                response.ticker
+                response.zeroGamma -> {priceInCents, grossGammaExposure,
+                    netGammaExposure, isCapSensitive, isOffSpot, isWrongSide}
+                response.levels -> {callWallPriceInCents, putWallPriceInCents?,
+                    maximumValueContractStrikePriceInCents, ...}
+                response.darkPoolLevels -> {price_cents: size}
+                response.liveSession -> {sessionDate, observations: [...]}
+                    (today's running session, observations every ~15min)
+                response.historicalSessions -> [{sessionDate, observations}, ...]
+                    (same shape, one per prior session)
+                response.stockPriceInCentsByEpochMillisTimestamp -> {ts_ms: price_cents}
+                response.stockPriceOhlcByEpochMillisTimestamp -> {ts_ms: {open,high,low,close,timestamp}}
+
+            Each observation: {targetTimeEpochMillisTimestamp, state
+                (PIN/GRIND/HOSTILE), stockPriceInCents, realizedVolatilityPercentage?,
+                atTheMoneyStrikePriceInCents?, atTheMoneyCallPriceInCents?,
+                atTheMoneyPutPriceInCents?, atTheMoneyDaysToExpiration?}
+        """
+        try:
+            r = self._make_request(
+                "GET", f"options/exposure/forecast/{tool_id}", timeout=30
+            )
+            return r.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch exposure forecast: {e}")
+            return None
+
+    # ------------------------------------------------------------------
     # Generic fetch by ToolSpec
     # ------------------------------------------------------------------
 
